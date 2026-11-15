@@ -11,10 +11,16 @@ The terminal UI is built with [rich](https://github.com/Textualize/rich): a live
 ## Requirements
 
 ```bash
-pip install faster-whisper torch rich
+pip install -r requirements.txt
 ```
 
-A CUDA-capable GPU is optional but strongly recommended for large batches or big models. CPU transcription works but is significantly slower.
+A CUDA-capable GPU is optional but strongly recommended for large batches or big models. On Windows, install the CUDA build of PyTorch so faster-whisper finds the cuBLAS/cuDNN libraries:
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu126
+```
+
+If no GPU is found, or the GPU fails to initialise, WhisperForge falls back to the CPU automatically. CPU transcription works but is significantly slower.
 
 ---
 
@@ -34,11 +40,13 @@ Each file gets a transcript saved alongside it with the same stem:
 | Flag | Default | Description |
 |---|---|---|
 | `--root-dir DIR` | *(required)* | Folder to scan recursively for media files |
-| `--language LANG` | `de` | ISO 639-1 language code (`en`, `fr`, `de`, …) |
+| `--language LANG` | `de` | ISO 639-1 language code (`en`, `fr`, `de`, …), or `auto` to detect |
 | `--model SIZE` | `large-v3` | Whisper model to use (see table below) |
 | `--format` | `txt` | Output format: `txt` (plain text) or `srt` (subtitles) |
-| `--output-dir DIR` | next to source | Write all transcripts to a single folder |
+| `--output-dir DIR` | next to source | Write transcripts to one folder, mirroring the subfolder structure |
 | `--extensions EXT,EXT` | all supported | Limit which file types are scanned |
+| `--prompt TEXT` | — | Names or jargon that help recognition, e.g. `"Fahrgemeinschaft, Franken, App"` |
+| `--batch-size N` | `8` | GPU batch size; lower it if you run out of VRAM |
 | `--dry-run` | off | Show what would be transcribed without doing any work |
 | `--force` | off | Re-transcribe files that already have output |
 
@@ -67,7 +75,7 @@ python whisperforge.py --root-dir "E:\Videos" --force
 
 ## Supported formats
 
-`mp4` `mkv` `avi` `mov` `webm` `mp3` `wav` `m4a` `flac` `ogg`
+`mp4` `mkv` `avi` `mov` `webm` `mp3` `wav` `m4a` `flac` `ogg` `opus`
 
 ---
 
@@ -81,9 +89,12 @@ Models are downloaded automatically on first use and cached locally (~/.cache/hu
 | `base` | ~1 GB | ★★★★☆ | — |
 | `small` | ~2 GB | ★★★☆☆ | — |
 | `medium` | ~5 GB | ★★☆☆☆ | Good balance of speed and accuracy |
-| `large-v2` | ~10 GB | ★☆☆☆☆ | — |
-| `large-v3` | ~10 GB | ★☆☆☆☆ | Best accuracy — default |
-| `distil-large-v3` | ~6 GB | ★★★☆☆ | Near large-v3 quality at lower cost |
+| `large-v2` | ~5 GB | ★☆☆☆☆ | — |
+| `large-v3` | ~5 GB | ★☆☆☆☆ | Best accuracy — default |
+| `large-v3-turbo` / `turbo` | ~3 GB | ★★★★☆ | Close to large-v3, several times faster |
+| `distil-large-v3` | ~3 GB | ★★★☆☆ | English only |
+
+VRAM figures are for float16 on the GPU (what WhisperForge uses); `large-v3` runs fine on an 8 GB card. Run `python whisperforge.py --help` for the full list of model names.
 
 ---
 
@@ -106,4 +117,8 @@ La religion, ça doit être privé pour tout le monde.
 Il ne faut jamais poser cette question à quelqu'un.
 ```
 
-All output files are UTF-8 encoded with a BOM for seamless Windows compatibility.
+SRT cues are built from word timestamps and split at sentence ends, at most ~84 characters or 6 seconds per cue.
+
+All output files are UTF-8 encoded with a BOM for seamless Windows compatibility. Files are written atomically, so an interrupted run never leaves a half-written transcript that would be skipped next time.
+
+Silence is skipped with voice activity detection (VAD), which speeds things up and reduces hallucinated text. The exit code is `0` on success, `1` if any file failed and `130` if interrupted with Ctrl+C.
