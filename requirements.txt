@@ -1,2 +1,6 @@
-# Core dependency — installs torch automatically
-openai-whisper>=20231117
+faster-whisper>=1.1.0
+rich>=13.0
+# Optional but recommended on Windows with an NVIDIA GPU: provides the CUDA
+# libraries (cuBLAS/cuDNN) that faster-whisper needs. Install the CUDA build:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu126
+torch
