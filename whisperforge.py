@@ -5,12 +5,15 @@ Powered by faster-whisper
 """
 
 import argparse
+import glob
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 try:
     from rich.console import Console
+    from rich.markup import escape
     from rich.panel import Panel
     from rich.table import Table
     from rich.progress import (
@@ -59,18 +62,25 @@ def print_banner():
     console.print()
 
 
-def print_config(args, root_path: Path, output_dir: Path | None, extensions: set[str]):
+MAX_CONFIG_INPUTS = 5
+
+
+def print_config(args, output_dir: Path | None, extensions: set[str]):
     grid = Table.grid(padding=(0, 3))
     grid.add_column(style="dim", justify="right")
     grid.add_column(style="cyan")
-    grid.add_row("root",       str(root_path))
-    grid.add_row("output",     str(output_dir) if output_dir else "[dim](next to source)[/]")
+    shown = args.inputs[:MAX_CONFIG_INPUTS]
+    for i, raw in enumerate(shown):
+        grid.add_row("input" if i == 0 else "", escape(raw))
+    if len(args.inputs) > len(shown):
+        grid.add_row("", f"[dim]… and {len(args.inputs) - len(shown)} more[/]")
+    grid.add_row("output",     escape(str(output_dir)) if output_dir else "[dim](next to source)[/]")
     grid.add_row("model",      args.model)
-    grid.add_row("language",   args.language)
+    grid.add_row("language",   escape(args.language))
     grid.add_row("format",     args.format)
     grid.add_row("extensions", "  ".join(sorted(extensions)))
     if args.prompt:
-        grid.add_row("prompt", args.prompt)
+        grid.add_row("prompt", escape(args.prompt))
     console.print(Panel(grid, title="[bold dim]Configuration[/]", border_style="dim",
                         box=box.ROUNDED, expand=False))
     console.print()
@@ -96,12 +106,78 @@ def parse_extensions(raw: str | None) -> set[str]:
     return exts
 
 
+def fail(message: str, code: int = 1):
+    """Print an error and exit. `message` is rich markup; escape user data in it."""
+    console.print(f"[bold red]✗[/]  {message}")
+    sys.exit(code)
+
+
 def find_media_files(root: Path, extensions: set[str]) -> list[Path]:
-    if not root.is_dir():
-        console.print(f"[bold red]✗  Directory not found:[/] {root}")
-        sys.exit(1)
     return sorted(p for p in root.rglob("*")
                   if p.suffix.lower() in extensions and p.is_file())
+
+
+def collect_sources(raw_inputs: list[str], extensions: set[str]) -> list[tuple[Path, Path]]:
+    """Resolve CLI inputs to sorted (media file, base folder) pairs.
+
+    Folders are scanned recursively and act as the base, so --output-dir mirrors
+    their subfolders. A single file's base is its own folder. Wildcards are expanded
+    here because cmd.exe and PowerShell pass them through literally.
+    """
+    found: dict[Path, Path] = {}
+
+    def add_folder(folder: Path):
+        for f in find_media_files(folder, extensions):
+            found.setdefault(f, folder)
+
+    for raw in raw_inputs:
+        path = Path(raw).expanduser()
+        if not path.exists() and any(c in raw for c in "*?["):
+            matches = [Path(m).resolve() for m in glob.glob(str(path), recursive=True)]
+            if not matches:
+                console.print(f"  [yellow]⚠  Nothing matches[/] {escape(raw)}")
+            for m in matches:
+                if m.is_dir():
+                    add_folder(m)
+                elif m.suffix.lower() in extensions:
+                    found.setdefault(m, m.parent)
+            continue
+
+        path = path.resolve()
+        if path.is_dir():
+            add_folder(path)
+        elif path.is_file():
+            if path.suffix.lower() not in extensions | SUPPORTED_EXTENSIONS:
+                fail(f"Unsupported file type: {escape(str(path))}  "
+                     f"[dim](add it with --extensions {escape(path.suffix.lstrip('.'))})[/]", 2)
+            found.setdefault(path, path.parent)
+        else:
+            fail(f"Not found: {escape(raw)}")
+    return sorted(found.items())
+
+
+def plan_jobs(sources: list[tuple[Path, Path]], suffix: str,
+              output_dir: Path | None) -> list[tuple[Path, Path, Path]]:
+    """Return (source, base, output) triples, making sure no two sources share an output."""
+    jobs = [(src, base, resolve_output_path(src, base, suffix, output_dir))
+            for src, base in sources]
+
+    # talk.mp4 and talk.mp3 in one folder would both become talk.txt and overwrite each other.
+    # Name those after the full source file instead: talk.mp4.txt, talk.mp3.txt.
+    counts = Counter(out for _, _, out in jobs)
+    jobs = [(src, base, out.with_name(src.name + suffix) if counts[out] > 1 else out)
+            for src, base, out in jobs]
+
+    counts = Counter(out for _, _, out in jobs)
+    clashes = sorted({out for out, n in counts.items() if n > 1})
+    if clashes:
+        lines = "\n".join(f"    {escape(str(c))}" for c in clashes)
+        fail(f"Several inputs would write the same transcript:\n{lines}\n"
+             f"  [dim]Transcribe them separately or drop --output-dir.[/]", 2)
+    for src, _, out in jobs:
+        if out == src:
+            fail(f"Transcript would overwrite its own source: {escape(str(src))}", 2)
+    return jobs
 
 
 def format_duration(seconds: float) -> str:
@@ -189,10 +265,10 @@ def transcribe_file(model, path: Path, args, batched: bool, on_progress) -> tupl
     return text, words
 
 
-def resolve_output_path(src: Path, root: Path, suffix: str, output_dir: Path | None) -> Path:
+def resolve_output_path(src: Path, base: Path, suffix: str, output_dir: Path | None) -> Path:
     if output_dir:
         # Mirror the folder structure so equal names in different subfolders don't collide.
-        return output_dir / src.relative_to(root).with_suffix(suffix)
+        return output_dir / src.relative_to(base).with_suffix(suffix)
     return src.with_suffix(suffix)
 
 
@@ -238,10 +314,17 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="WhisperForge — batch-transcribe audio/video with faster-whisper",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Supported: " + "  ".join(sorted(SUPPORTED_EXTENSIONS)),
+        epilog="Supported: " + "  ".join(sorted(SUPPORTED_EXTENSIONS)) + "\n\n"
+               "Examples:\n"
+               "  whisperforge interview.mp4\n"
+               "  whisperforge a.mp3 b.wav --format srt\n"
+               "  whisperforge \"D:\\Videos\" --output-dir \"D:\\Transcripts\"\n"
+               "  whisperforge \"D:\\Podcasts\\*.mp3\" --language en",
     )
-    parser.add_argument("--root-dir",   required=True,  metavar="DIR",
-                        help="Folder to scan for media files")
+    parser.add_argument("inputs",       nargs="*",      metavar="PATH",
+                        help="Media files and/or folders (scanned recursively); wildcards like *.mp3 work")
+    parser.add_argument("--root-dir",   action="append", default=[], metavar="DIR",
+                        help="Folder to scan; same as passing it as PATH (can be repeated)")
     parser.add_argument("--output-dir", default=None,   metavar="DIR",
                         help="Save transcripts here, mirroring subfolders (default: next to source)")
     parser.add_argument("--model",      default=DEFAULT_MODEL_SIZE, metavar="SIZE",
@@ -261,7 +344,11 @@ def parse_args():
                         help="List discovered files without transcribing")
     parser.add_argument("--force",      action="store_true",
                         help="Re-transcribe even if output file already exists")
-    args = parser.parse_args()
+    # Intermixed so options may follow the paths: whisperforge a.mp3 --format srt b.mp3
+    args = parser.parse_intermixed_args()
+    args.inputs = args.root_dir + args.inputs
+    if not args.inputs:
+        parser.error("give at least one file or folder to transcribe")
     if args.batch_size < 1:
         parser.error("--batch-size must be >= 1")
     return args
@@ -273,30 +360,29 @@ def main():
     print_banner()
     args = parse_args()
 
-    root_path  = Path(args.root_dir).resolve()
-    output_dir = Path(args.output_dir).resolve() if args.output_dir else None
+    output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else None
     suffix     = f".{args.format}"
     extensions = parse_extensions(args.extensions)
 
-    print_config(args, root_path, output_dir, extensions)
+    print_config(args, output_dir, extensions)
 
     # ── Discover files ─────────────────────────────────────────────────────────
     with console.status("[cyan]Scanning for media files …[/]"):
-        files = find_media_files(root_path, extensions)
+        sources = collect_sources(args.inputs, extensions)
 
-    if not files:
+    if not sources:
         console.print(Panel("[yellow]No media files found — nothing to do.[/]",
                             border_style="yellow", box=box.ROUNDED))
         sys.exit(0)
 
-    jobs    = [(f, resolve_output_path(f, root_path, suffix, output_dir)) for f in files]
-    done    = {f for f, out in jobs if out.exists()}
-    pending = [(f, out) for f, out in jobs if args.force or f not in done]
+    jobs    = plan_jobs(sources, suffix, output_dir)
+    done    = {src for src, _, out in jobs if out.exists()}
+    pending = [(src, out) for src, _, out in jobs if args.force or src not in done]
 
     console.print(
-        f"  Found [bold cyan]{len(files)}[/] file(s)  "
-        f"[green]({len(done)} done)[/]  "
-        f"[yellow]({len(files) - len(done)} pending)[/]\n"
+        f"  Found [bold cyan]{len(jobs)}[/] file(s)  "
+        f"[green]({len(jobs) - len(pending)} done)[/]  "
+        f"[yellow]({len(pending)} to transcribe)[/]\n"
     )
 
     table = Table(box=box.ROUNDED, border_style="cyan",
@@ -306,11 +392,16 @@ def main():
     table.add_column("Output", style="dim",   overflow="fold")
     table.add_column("Status", justify="center", width=11)
 
-    for i, (f, out) in enumerate(jobs, 1):
-        out_label = str(out.relative_to(output_dir or root_path))
-        status = (Text("✓  done",    style="bold green") if f in done else
-                  Text("·  pending", style="yellow"))
-        table.add_row(str(i), str(f.relative_to(root_path)), out_label, status)
+    for i, (src, base, out) in enumerate(jobs, 1):
+        # Text objects, not markup strings: file names may contain [brackets].
+        out_label = Text(str(out.relative_to(output_dir or base)))
+        if src not in done:
+            status = Text("·  pending", style="yellow")
+        elif args.force:
+            status = Text("↻  redo",    style="yellow")
+        else:
+            status = Text("✓  done",    style="bold green")
+        table.add_row(str(i), Text(str(src.relative_to(base))), out_label, status)
 
     console.print(table)
     console.print()
@@ -359,7 +450,8 @@ def main():
 
         try:
             for src, out in pending:
-                progress.reset(current, total=1, description=f"[white]{src.name}[/]", visible=True)
+                name = escape(src.name)
+                progress.reset(current, total=1, description=f"[white]{name}[/]", visible=True)
                 t0 = time.time()
                 try:
                     text, words = transcribe_file(model, src, args, batched, on_progress)
@@ -367,13 +459,14 @@ def main():
                     ok          += 1
                     total_words += words
                     progress.console.print(
-                        f"  [bold green]✔[/]  [white]{src.name}[/]  "
+                        f"  [bold green]✔[/]  [white]{name}[/]  "
                         f"[dim]·  {format_duration(time.time() - t0)}  ·  {words:,} words[/]"
                     )
                 except Exception as exc:
                     progress.console.print(
-                        f"  [bold red]✗[/]  [white]{src.name}[/]  "
-                        f"[dim red]failed after {format_duration(time.time() - t0)}:[/]  {exc}"
+                        f"  [bold red]✗[/]  [white]{name}[/]  "
+                        f"[dim red]failed after {format_duration(time.time() - t0)}:[/]  "
+                        f"{escape(str(exc))}"
                     )
                     failed.append((src, str(exc)))
                 progress.advance(overall)
@@ -406,7 +499,7 @@ def main():
         err_table.add_column("File",  style="white")
         err_table.add_column("Error", style="dim red")
         for path, err in failed:
-            err_table.add_row(path.name, err)
+            err_table.add_row(Text(path.name), Text(err))
         console.print(err_table)
 
     console.print()
@@ -417,4 +510,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Ctrl+C outside the transcription loop (scanning, model download/loading)
+        console.print("\n[yellow]Interrupted.[/]")
+        sys.exit(130)
